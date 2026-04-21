@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestOrderedMap_BasicOperations(t *testing.T) {
@@ -1783,4 +1784,95 @@ func TestOrderedMap_UnmarshalJSONExtended(t *testing.T) {
 			t.Error("Map structure invalid")
 		}
 	})
+}
+
+func TestOrderedMap_MarshalJSONPreservesOrder(t *testing.T) {
+	om := NewOrderedMap()
+	keys := []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa"}
+	for i, k := range keys {
+		om.Set(k, i)
+	}
+
+	data, err := json.Marshal(om)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.Token() // {
+	var gotKeys []string
+	for dec.More() {
+		tok, _ := dec.Token()
+		gotKeys = append(gotKeys, tok.(string))
+		var v any
+		dec.Decode(&v)
+	}
+
+	for i, k := range keys {
+		if i >= len(gotKeys) || gotKeys[i] != k {
+			t.Errorf("MarshalJSON did not preserve insertion order: want %v, got %v", keys, gotKeys)
+			return
+		}
+	}
+}
+
+func TestOrderedMap_UnmarshalJSONPreservesOrder(t *testing.T) {
+	jsonStr := `{"first":1,"second":2,"third":3,"fourth":4,"fifth":5}`
+	om := NewOrderedMap()
+	if err := json.Unmarshal([]byte(jsonStr), om); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	want := []string{"first", "second", "third", "fourth", "fifth"}
+	got := make([]string, 0, om.Len())
+	for _, k := range om.Keys() {
+		got = append(got, k.(string))
+	}
+
+	for i, k := range want {
+		if i >= len(got) || got[i] != k {
+			t.Errorf("UnmarshalJSON did not preserve insertion order: want %v, got %v", want, got)
+			return
+		}
+	}
+}
+
+func TestOrderedMap_ClearThreadSafe(t *testing.T) {
+	om := NewOrderedMap()
+	for i := 0; i < 100; i++ {
+		om.Set(i, i)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(3)
+		go func() { defer wg.Done(); om.Clear() }()
+		go func(v int) { defer wg.Done(); om.Set(v, v) }(i)
+		go func(v int) { defer wg.Done(); om.Get(v) }(i)
+	}
+	wg.Wait()
+}
+
+func TestOrderedMap_RangeModifySameMap(t *testing.T) {
+	om := NewOrderedMap()
+	om.Set("a", 1)
+	om.Set("b", 2)
+
+	done := make(chan struct{})
+	go func() {
+		om.Range(func(key, value any) bool {
+			om.Set("c", 3)
+			return false
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if !om.Has("c") {
+			t.Error("Set inside Range did not take effect")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Deadlock: Set inside Range hung")
+	}
 }

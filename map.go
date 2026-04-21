@@ -188,25 +188,29 @@ func (om *OrderedMap) Values() []any {
 //	})
 func (om *OrderedMap) Range(f func(key, value any) bool) {
 	om.mu.RLock()
-	defer om.mu.RUnlock()
+	type entry struct{ key, value any }
+	entries := make([]entry, 0, om.length)
+	for current := om.head; current != nil; current = current.next {
+		entries = append(entries, entry{current.Key, current.Value})
+	}
+	om.mu.RUnlock()
 
-	current := om.head
-	for current != nil {
-		if !f(current.Key, current.Value) {
+	for _, e := range entries {
+		if !f(e.key, e.value) {
 			break
 		}
-		current = current.next
 	}
 }
 
 // Clear removes all elements from the map, resetting it to an empty state.
-// This operation is not atomic - if you need atomicity, you should implement
-// your own locking around this method.
+// This method is thread-safe.
 //
 // Example:
 //
 //	om.Clear()
 func (om *OrderedMap) Clear() {
+	om.mu.Lock()
+	defer om.mu.Unlock()
 	om.nodeMap = make(map[any]*Node)
 	om.head = nil
 	om.tail = nil
@@ -247,17 +251,18 @@ func (om *OrderedMap) String() string {
 	om.mu.RLock()
 	defer om.mu.RUnlock()
 
-	result := "{"
+	var buf bytes.Buffer
+	buf.WriteByte('{')
 	current := om.head
 	for current != nil {
 		if current != om.head {
-			result += ", "
+			buf.WriteString(", ")
 		}
-		result += fmt.Sprintf("%v: %v", current.Key, current.Value)
+		fmt.Fprintf(&buf, "%v: %v", current.Key, current.Value)
 		current = current.next
 	}
-	result += "}"
-	return result
+	buf.WriteByte('}')
+	return buf.String()
 }
 
 // Len returns the number of elements in the map.
@@ -306,10 +311,8 @@ func (om *OrderedMap) Copy() *OrderedMap {
 	defer om.mu.RUnlock()
 
 	newMap := NewOrderedMap()
-	current := om.head
-	for current != nil {
-		_ = newMap.Set(current.Key, current.Value)
-		current = current.next
+	for current := om.head; current != nil; current = current.next {
+		_ = newMap.set(current.Key, current.Value)
 	}
 	return newMap
 }
@@ -328,22 +331,36 @@ func (om *OrderedMap) MarshalJSON() ([]byte, error) {
 	om.mu.RLock()
 	defer om.mu.RUnlock()
 
-	// Create a temporary map for JSON marshaling
-	tmpMap := make(map[string]interface{})
-
-	// Iterate through the ordered map and add to temporary map
+	var buf bytes.Buffer
+	buf.WriteByte('{')
 	current := om.head
+	first := true
 	for current != nil {
-		// Convert key to string if possible
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+
 		keyStr, ok := current.Key.(string)
 		if !ok {
 			keyStr = fmt.Sprintf("%v", current.Key)
 		}
-		tmpMap[keyStr] = current.Value
+		keyBytes, err := json.Marshal(keyStr)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+
+		valBytes, err := json.Marshal(current.Value)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(valBytes)
 		current = current.next
 	}
-
-	return json.Marshal(tmpMap)
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }
 
 // UnmarshalJSON implements the json.Unmarshaler interface.
@@ -358,29 +375,41 @@ func (om *OrderedMap) MarshalJSON() ([]byte, error) {
 //	    log.Fatal(err)
 //	}
 func (om *OrderedMap) UnmarshalJSON(data []byte) error {
-	// Create a temporary map for JSON unmarshaling
-	tmpMap := make(map[string]interface{})
-	if err := json.Unmarshal(data, &tmpMap); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+
+	tok, err := dec.Token()
+	if err != nil {
 		return err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("expected JSON object, got %v", tok)
 	}
 
 	om.mu.Lock()
 	defer om.mu.Unlock()
 
-	// Clear existing data without locking (we already have the lock)
 	om.nodeMap = make(map[any]*Node)
 	om.head = nil
 	om.tail = nil
 	om.length = 0
 
-	// Add items to ordered map
-	for k, v := range tmpMap {
-		// Use internal set method to avoid double locking
-		if err := om.set(k, v); err != nil {
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("expected string key, got %T", keyTok)
+		}
+		var value any
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+		if err := om.set(key, value); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -464,10 +493,8 @@ func (om *OrderedMap) Reverse() *OrderedMap {
 	defer om.mu.RUnlock()
 
 	reversed := NewOrderedMap()
-	current := om.tail
-	for current != nil {
-		_ = reversed.Set(current.Key, current.Value)
-		current = current.prev
+	for current := om.tail; current != nil; current = current.prev {
+		_ = reversed.set(current.Key, current.Value)
 	}
 	return reversed
 }
@@ -490,12 +517,10 @@ func (om *OrderedMap) Filter(predicate func(key, value any) bool) *OrderedMap {
 	defer om.mu.RUnlock()
 
 	filtered := NewOrderedMap()
-	current := om.head
-	for current != nil {
+	for current := om.head; current != nil; current = current.next {
 		if predicate(current.Key, current.Value) {
-			_ = filtered.Set(current.Key, current.Value)
+			_ = filtered.set(current.Key, current.Value)
 		}
-		current = current.next
 	}
 	return filtered
 }
@@ -517,11 +542,9 @@ func (om *OrderedMap) Map(mapper func(key, value any) (any, any)) *OrderedMap {
 	defer om.mu.RUnlock()
 
 	mapped := NewOrderedMap()
-	current := om.head
-	for current != nil {
+	for current := om.head; current != nil; current = current.next {
 		newKey, newValue := mapper(current.Key, current.Value)
-		_ = mapped.Set(newKey, newValue)
-		current = current.next
+		_ = mapped.set(newKey, newValue)
 	}
 	return mapped
 }
@@ -562,9 +585,16 @@ func (om *OrderedMap) ToJSON(opts *JSONOptions) ([]byte, error) {
 	om.mu.RLock()
 	defer om.mu.RUnlock()
 
-	tmpMap := make(map[string]interface{})
+	var buf bytes.Buffer
+	buf.WriteByte('{')
 	current := om.head
+	first := true
 	for current != nil {
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+
 		var key string
 		if opts.KeyAsString {
 			key = fmt.Sprintf("%v", current.Key)
@@ -574,9 +604,15 @@ func (om *OrderedMap) ToJSON(opts *JSONOptions) ([]byte, error) {
 			return nil, fmt.Errorf("non-string key %v cannot be converted to JSON", current.Key)
 		}
 
+		keyBytes, err := json.Marshal(key)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+
 		value := current.Value
 		if opts.PreserveType {
-			// Attempt to preserve numeric types
 			if str, ok := value.(string); ok {
 				if v, err := json.Number(str).Int64(); err == nil {
 					value = v
@@ -586,14 +622,23 @@ func (om *OrderedMap) ToJSON(opts *JSONOptions) ([]byte, error) {
 			}
 		}
 
-		tmpMap[key] = value
+		valBytes, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(valBytes)
 		current = current.next
 	}
+	buf.WriteByte('}')
 
 	if opts.PrettyPrint {
-		return json.MarshalIndent(tmpMap, "", "  ")
+		var indented bytes.Buffer
+		if err := json.Indent(&indented, buf.Bytes(), "", "  "); err != nil {
+			return nil, err
+		}
+		return indented.Bytes(), nil
 	}
-	return json.Marshal(tmpMap)
+	return buf.Bytes(), nil
 }
 
 // FromJSON populates the OrderedMap from a JSON byte array with the specified options.
@@ -617,29 +662,44 @@ func (om *OrderedMap) FromJSON(data []byte, opts *JSONOptions) error {
 		}
 	}
 
-	var tmpMap map[string]interface{}
-	d := json.NewDecoder(bytes.NewReader(data))
+	dec := json.NewDecoder(bytes.NewReader(data))
 	if opts.PreserveType {
-		d.UseNumber()
+		dec.UseNumber()
 	}
-	if err := d.Decode(&tmpMap); err != nil {
+
+	tok, err := dec.Token()
+	if err != nil {
 		return err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("expected JSON object, got %v", tok)
 	}
 
 	om.mu.Lock()
 	defer om.mu.Unlock()
 
-	// Clear existing data
 	om.nodeMap = make(map[any]*Node)
 	om.head = nil
 	om.tail = nil
 	om.length = 0
 
-	// Add items to ordered map
-	for k, v := range tmpMap {
-		var key interface{} = k
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		k, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("expected string key, got %T", keyTok)
+		}
+
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return err
+		}
+
+		var key any = k
 		if !opts.KeyAsString {
-			// Attempt to convert string key to appropriate type
 			if i, err := strconv.ParseInt(k, 10, 64); err == nil {
 				key = i
 			} else if f, err := strconv.ParseFloat(k, 64); err == nil {
@@ -659,6 +719,5 @@ func (om *OrderedMap) FromJSON(data []byte, opts *JSONOptions) error {
 			return err
 		}
 	}
-
 	return nil
 }
